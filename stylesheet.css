@@ -1,7 +1,12 @@
 .llmpulse-label {
     font-size: 11px;
     font-weight: bold;
-    margin-left: 2px;
+    margin-left: 4px;
     margin-right: 2px;
+    color: #8bc34a;
+}
+
+.llmpulse-icon {
+    -st-icon-style: symbolic;
     color: #8bc34a;
 }

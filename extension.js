@@ -10,6 +10,9 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
+// Set at enable() so the inner class can find the shipped SVG.
+let EXTENSION_PATH = null;
+
 const REFRESH_SECONDS = 120;
 
 // Keep these in sync with the llmpulse CLI. Numbers are rough estimates
@@ -43,14 +46,26 @@ class CcusageIndicator extends PanelMenu.Button {
     _init() {
         super._init(0.0, 'LLMpulse');
 
-        // Top-bar label only — no separate icon. The tree emoji lives in
-        // the label so it stays aligned with the number across themes.
+        // GNOME panel font (Cantarell) has no emoji glyphs and St doesn't
+        // reliably fall back, so ship a real SVG and render via St.Icon.
+        this._box = new St.BoxLayout({style_class: 'panel-status-indicators-box'});
+
+        const iconPath = GLib.build_filenamev([EXTENSION_PATH, 'icons', 'tree-symbolic.svg']);
+        this._icon = new St.Icon({
+            gicon: Gio.icon_new_for_string(iconPath),
+            style_class: 'system-status-icon llmpulse-icon',
+            icon_size: 14,
+        });
+        this._box.add_child(this._icon);
+
         this._label = new St.Label({
-            text: '🌲 …',
+            text: '…',
             y_align: Clutter.ActorAlign.CENTER,
             style_class: 'llmpulse-label',
         });
-        this.add_child(this._label);
+        this._box.add_child(this._label);
+
+        this.add_child(this._box);
 
         // Dropdown items — climate damage report.
         this._treesItem = new PopupMenu.PopupMenuItem('🌲 Tree-years to offset: --');
@@ -132,14 +147,14 @@ class CcusageIndicator extends PanelMenu.Button {
                     if (stdout && stdout.trim()) {
                         this._parseAndUpdate(stdout.trim());
                     } else {
-                        this._label.set_text('🌲 N/A');
+                        this._label.set_text('N/A');
                     }
                 } catch {
-                    this._label.set_text('🌲 err');
+                    this._label.set_text('err');
                 }
             });
         } catch {
-            this._label.set_text('🌲 err');
+            this._label.set_text('err');
         }
     }
 
@@ -161,7 +176,7 @@ class CcusageIndicator extends PanelMenu.Button {
             const treeYears = (gCO2 / 1000) / KG_CO2_PER_TREE_YEAR;
             const treesCut = (gCO2 / 1000) / KG_CO2_PER_TREE_LIFETIME;
 
-            this._label.set_text(`🌲 ${this._fmtTrees(treeYears)}`);
+            this._label.set_text(this._fmtTrees(treeYears));
 
             this._treesItem.label.set_text(`🌲 Tree-years to offset: ${this._fmtTrees(treeYears)}`);
             this._treesCutItem.label.set_text(`🪓 Trees-cut-equivalent: ${this._fmtTrees(treesCut)}`);
@@ -177,7 +192,7 @@ class CcusageIndicator extends PanelMenu.Button {
             const seed = Math.floor(wh * 1000) + totalTokens;
             this._verdictItem.label.set_text(`💬 ${VERDICTS[seed % VERDICTS.length]}`);
         } catch {
-            this._label.set_text('🌲 parse err');
+            this._label.set_text('parse err');
         }
     }
 
@@ -223,6 +238,7 @@ class CcusageIndicator extends PanelMenu.Button {
 
 export default class LLMpulseExtension extends Extension {
     enable() {
+        EXTENSION_PATH = this.path;
         this._indicator = new CcusageIndicator();
         Main.panel.addToStatusArea(this.uuid, this._indicator, 1, 'right');
     }
@@ -230,5 +246,6 @@ export default class LLMpulseExtension extends Extension {
     disable() {
         this._indicator?.destroy();
         this._indicator = null;
+        EXTENSION_PATH = null;
     }
 }
