@@ -87,8 +87,17 @@ class CcusageIndicator extends PanelMenu.Button {
                 (today.getMonth() + 1).toString().padStart(2, '0') +
                 today.getDate().toString().padStart(2, '0');
 
+            // GNOME subprocesses don't inherit the user's interactive PATH, so
+            // ccusage installed via nvm/npm isn't on PATH. Extend PATH to cover
+            // common install locations (nvm, /usr/local/bin, ~/.local/bin,
+            // Homebrew, pnpm/yarn global bins) before exec'ing ccusage.
+            const cmd =
+                'for d in "$HOME/.nvm/versions/node"/*/bin; do [ -d "$d" ] && PATH="$d:$PATH"; done; ' +
+                'PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH"; ' +
+                `exec ccusage daily --since ${dateStr} --json --offline 2>/dev/null`;
+
             const proc = Gio.Subprocess.new(
-                ['bash', '-c', `/usr/local/bin/ccusage daily --since ${dateStr} --json --offline 2>/dev/null`],
+                ['bash', '-c', cmd],
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
             );
 

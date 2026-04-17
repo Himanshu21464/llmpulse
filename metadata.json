@@ -2,7 +2,7 @@
   "name": "Claude Code Usage",
   "description": "Shows daily Claude Code token usage in the GNOME top bar. Displays input, output, cache write, and cache read tokens with a dropdown breakdown. Requires ccusage CLI tool (npm install -g ccusage).",
   "uuid": "ccusage@claude",
-  "url": "https://github.com/AeoruEntity/ccusage-gnome",
+  "url": "https://github.com/Himanshu21464/llmpulse",
   "shell-version": ["45", "46", "47", "48"],
-  "version": 1
+  "version": 2
 }
