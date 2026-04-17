@@ -1,8 +1,8 @@
 {
-  "name": "Claude Code Usage",
-  "description": "Shows daily Claude Code token usage in the GNOME top bar. Displays input, output, cache write, and cache read tokens with a dropdown breakdown. Requires ccusage CLI tool (npm install -g ccusage).",
+  "name": "LLMpulse",
+  "description": "Shows the climate impact of your Claude Code usage in the GNOME top bar. The indicator shows a tree-equivalent count (🌲) based on tokens burned; the dropdown reports energy, CO₂, water, and a rotating sarcastic verdict. Ships with the llmpulse CLI for a full climate-guilt report in the terminal. Requires the ccusage CLI (npm install -g ccusage).",
   "uuid": "ccusage@claude",
   "url": "https://github.com/Himanshu21464/llmpulse",
   "shell-version": ["45", "46", "47", "48"],
-  "version": 2
+  "version": 3
 }

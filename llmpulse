@@ -1,0 +1,257 @@
+#!/usr/bin/env node
+// llmpulse - measure your LLM climate guilt
+//
+// Wraps `ccusage` and translates token counts into energy, CO2, water,
+// and tree-equivalent offsets. Numbers are rough order-of-magnitude
+// estimates aggregated from published ranges for frontier-model
+// inference; treat them as vibes-based accounting, not an LCA.
+
+const { spawnSync } = require('child_process');
+
+// --- Impact constants ----------------------------------------------------
+// Energy per token varies 10x+ across models and providers. 0.001 Wh/token
+// is a middle estimate for frontier-model inference (Patterson et al.;
+// MIT Tech Review coverage of GPT-4-class inference).
+const WH_PER_TOKEN = 0.001;
+// Cache reads cost real compute but less than full inference; discount.
+const CACHE_READ_DISCOUNT = 0.1;
+// Global grid average, IEA 2024.
+const G_CO2_PER_KWH = 475;
+// Datacenter water (cooling + upstream electricity), rough estimate.
+const ML_WATER_PER_KWH = 1800;
+// Mature hardwood, US Forest Service.
+const KG_CO2_PER_TREE_YEAR = 21.77;
+// Carbon stored in a mature tree over its lifetime, very rough.
+const KG_CO2_PER_TREE_LIFETIME = 450;
+
+// --- Sarcastic flavor text ----------------------------------------------
+const VERDICTS = [
+    'The Amazon rainforest left a one-star review.',
+    'A polar bear just sent you a passive-aggressive DM.',
+    'Greta Thunberg is writing a strongly worded tweet, as we speak.',
+    'Your carbon footprint called. It wants to schedule a 1:1.',
+    'Somewhere, a glacier sighed.',
+    'The planet is not mad, just disappointed.',
+    'Gaia is keeping receipts.',
+    'Your descendants will Google you in 2084. They will not be happy.',
+    'Every token you burn is a tiny scream from the troposphere.',
+    'A datacenter cooling tower wept gently into the night.',
+    'The IPCC cited you in a footnote. Not in a good way.',
+    'At this rate, "touch grass" will be a historical idiom.',
+    'The coral reefs said "we saw what you did there".',
+    'Three ice cubes melted specifically for your last prompt.',
+    'You are the reason the carbon budget has trust issues.',
+];
+
+function verdict(seed) {
+    return VERDICTS[seed % VERDICTS.length];
+}
+
+// --- Math ---------------------------------------------------------------
+function computeImpact(totals) {
+    const input = totals.inputTokens || 0;
+    const output = totals.outputTokens || 0;
+    const cacheCreate = totals.cacheCreationTokens || 0;
+    const cacheRead = totals.cacheReadTokens || 0;
+
+    const billed = input + output + cacheCreate;
+    const effectiveTokens = billed + cacheRead * CACHE_READ_DISCOUNT;
+    const totalTokens = input + output + cacheCreate + cacheRead;
+
+    const wh = effectiveTokens * WH_PER_TOKEN;
+    const kwh = wh / 1000;
+    const gCO2 = kwh * G_CO2_PER_KWH;
+    const mlWater = kwh * ML_WATER_PER_KWH;
+    const treeYears = (gCO2 / 1000) / KG_CO2_PER_TREE_YEAR;
+    const treesCut = (gCO2 / 1000) / KG_CO2_PER_TREE_LIFETIME;
+
+    return {
+        tokens: { input, output, cacheCreate, cacheRead, total: totalTokens, billed },
+        wh, kwh, gCO2, mlWater, treeYears, treesCut,
+        cost: totals.totalCost || 0,
+    };
+}
+
+// --- Formatting ---------------------------------------------------------
+function fmtTokens(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+    return String(n);
+}
+
+function fmtEnergy(wh) {
+    if (wh >= 1000) return (wh / 1000).toFixed(2) + ' kWh';
+    if (wh >= 1) return wh.toFixed(2) + ' Wh';
+    return (wh * 1000).toFixed(1) + ' mWh';
+}
+
+function fmtCO2(g) {
+    if (g >= 1000) return (g / 1000).toFixed(2) + ' kg';
+    if (g >= 1) return g.toFixed(2) + ' g';
+    return (g * 1000).toFixed(1) + ' mg';
+}
+
+function fmtWater(ml) {
+    if (ml >= 1000) return (ml / 1000).toFixed(2) + ' L';
+    return ml.toFixed(2) + ' ml';
+}
+
+function fmtTrees(n) {
+    if (n >= 10) return n.toFixed(1);
+    if (n >= 0.01) return n.toFixed(3);
+    return n.toExponential(2);
+}
+
+// --- Grounding comparisons (sarcastic color) ----------------------------
+function groundedComparison(impact) {
+    const wh = impact.wh;
+    // LED bulb ~10W. 1h of LED = 10 Wh.
+    const ledMinutes = (wh / 10) * 60;
+    // Boiling 1 cup of water ~35 Wh.
+    const cupsBoiled = wh / 35;
+    // Average car emits ~120 gCO2/km.
+    const carKm = impact.gCO2 / 120;
+    // Google search ~0.2 gCO2.
+    const googleSearches = impact.gCO2 / 0.2;
+
+    if (ledMinutes < 1) return `enough to power an LED bulb for ${(ledMinutes * 60).toFixed(1)} seconds. Truly devastating.`;
+    if (cupsBoiled < 1) return `enough to power an LED bulb for ${ledMinutes.toFixed(1)} minutes, or boil ${(cupsBoiled * 100).toFixed(0)}% of a cup of water.`;
+    if (carKm < 1) return `the equivalent of driving ${(carKm * 1000).toFixed(0)} m in an average car, or ${googleSearches.toFixed(0)} Google searches.`;
+    return `the equivalent of driving ${carKm.toFixed(2)} km in an average car, or boiling ${cupsBoiled.toFixed(1)} cups of water.`;
+}
+
+// --- ccusage invocation -------------------------------------------------
+function findCcusage() {
+    // Follow the same PATH logic as the GNOME extension.
+    const candidates = [];
+    const home = process.env.HOME || '';
+    if (home) {
+        const nvmBase = `${home}/.nvm/versions/node`;
+        try {
+            const fs = require('fs');
+            if (fs.existsSync(nvmBase)) {
+                for (const v of fs.readdirSync(nvmBase)) {
+                    candidates.push(`${nvmBase}/${v}/bin/ccusage`);
+                }
+            }
+        } catch { /* ignore */ }
+        candidates.push(`${home}/.local/bin/ccusage`);
+        candidates.push(`${home}/.npm-global/bin/ccusage`);
+        candidates.push(`${home}/.yarn/bin/ccusage`);
+    }
+    candidates.push('/opt/homebrew/bin/ccusage', '/usr/local/bin/ccusage', '/usr/bin/ccusage');
+
+    const fs = require('fs');
+    for (const c of candidates) {
+        try { if (fs.existsSync(c) && fs.statSync(c).isFile()) return c; } catch { /* ignore */ }
+    }
+    return 'ccusage'; // fall back to PATH
+}
+
+function runCcusage(args) {
+    const bin = findCcusage();
+    const res = spawnSync(bin, args, { encoding: 'utf8' });
+    if (res.status !== 0) {
+        const stderr = (res.stderr || '').trim();
+        throw new Error(`ccusage failed (${res.status}): ${stderr || 'no stderr'}`);
+    }
+    return JSON.parse(res.stdout);
+}
+
+function todayStamp() {
+    const d = new Date();
+    return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// --- CLI ----------------------------------------------------------------
+function parseArgs(argv) {
+    const opts = { since: todayStamp(), json: false, all: false, help: false };
+    for (let i = 0; i < argv.length; i++) {
+        const a = argv[i];
+        if (a === '-h' || a === '--help') opts.help = true;
+        else if (a === '--json') opts.json = true;
+        else if (a === '--all') opts.all = true;
+        else if (a === '--since') opts.since = argv[++i];
+        else {
+            console.error(`llmpulse: unknown argument: ${a}`);
+            process.exit(2);
+        }
+    }
+    return opts;
+}
+
+function printHelp() {
+    console.log(`llmpulse - climate guilt for your LLM habit
+
+Usage:
+  llmpulse                roast today's usage
+  llmpulse --all          roast your entire recorded history
+  llmpulse --since DATE   roast usage since DATE (YYYYMMDD)
+  llmpulse --json         machine-readable impact metrics
+  llmpulse -h, --help     this text
+
+Numbers are rough estimates from public LLM-inference ranges.
+No tree was literally cut in the making of this report. Probably.`);
+}
+
+function sarcasticReport(impact, label) {
+    const lines = [];
+    const t = impact.tokens;
+    const seed = Math.floor(impact.wh * 1000) + t.total;
+
+    lines.push(`\x1b[1m\x1b[32m🌍  llmpulse — your climate crime report (${label})  🌍\x1b[0m`);
+    lines.push('');
+    lines.push(`You vaporized \x1b[1m${fmtTokens(t.total)}\x1b[0m tokens.`);
+    lines.push(`  input: ${fmtTokens(t.input)}   output: ${fmtTokens(t.output)}   cache write: ${fmtTokens(t.cacheCreate)}   cache read: ${fmtTokens(t.cacheRead)}`);
+    lines.push('');
+    lines.push(`\x1b[33m⚡  Energy burned:\x1b[0m       ${fmtEnergy(impact.wh)}`);
+    lines.push(`\x1b[31m☁️   CO₂ belched:\x1b[0m        ${fmtCO2(impact.gCO2)}`);
+    lines.push(`\x1b[36m💧  Water evaporated:\x1b[0m    ${fmtWater(impact.mlWater)}`);
+    lines.push(`\x1b[32m🌲  Tree-years to offset:\x1b[0m ${fmtTrees(impact.treeYears)}`);
+    lines.push(`\x1b[32m🪓  Trees-cut-equivalent:\x1b[0m ${fmtTrees(impact.treesCut)}`);
+    if (impact.cost > 0) lines.push(`\x1b[35m💸  Your wallet paid:\x1b[0m    $${impact.cost.toFixed(4)}`);
+    lines.push('');
+    lines.push(`That's ${groundedComparison(impact)}`);
+    lines.push('');
+    lines.push(`\x1b[2m${verdict(seed)}\x1b[0m`);
+    lines.push('');
+    lines.push(`\x1b[2mDefaults: ${WH_PER_TOKEN} Wh/token · ${G_CO2_PER_KWH} g CO₂/kWh · ${KG_CO2_PER_TREE_YEAR} kg CO₂/tree-year. Vibes-based estimates; don't cite in a paper.\x1b[0m`);
+
+    return lines.join('\n');
+}
+
+function main() {
+    const opts = parseArgs(process.argv.slice(2));
+    if (opts.help) { printHelp(); return; }
+
+    const args = ['daily', '--json', '--offline'];
+    let label;
+    if (opts.all) {
+        label = 'all-time';
+    } else {
+        args.push('--since', opts.since);
+        label = opts.since === todayStamp() ? 'today' : `since ${opts.since}`;
+    }
+
+    let data;
+    try {
+        data = runCcusage(args);
+    } catch (e) {
+        console.error(`llmpulse: couldn't read ccusage data: ${e.message}`);
+        console.error(`Is ccusage installed? Try: npm install -g ccusage`);
+        process.exit(1);
+    }
+
+    const totals = data.totals || {};
+    const impact = computeImpact(totals);
+
+    if (opts.json) {
+        console.log(JSON.stringify({ label, ...impact }, null, 2));
+        return;
+    }
+
+    console.log(sarcasticReport(impact, label));
+}
+
+main();
