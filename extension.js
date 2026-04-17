@@ -15,14 +15,29 @@ let EXTENSION_PATH = null;
 
 const REFRESH_SECONDS = 120;
 
-// Keep these in sync with the llmpulse CLI. Numbers are rough estimates
-// from published LLM-inference ranges; don't cite in a paper.
-const WH_PER_TOKEN = 0.001;
-const CACHE_READ_DISCOUNT = 0.1;
-const G_CO2_PER_KWH = 475;
-const ML_WATER_PER_KWH = 1800;
-const KG_CO2_PER_TREE_YEAR = 21.77;
+// Keep these in sync with the llmpulse CLI. See `llmpulse --sources` for
+// the citations behind every constant.
+const BASELINE_WH_PER_TOKEN = {
+    input: 0.00040,
+    output: 0.00200,
+    cacheCreate: 0.00040,
+    cacheRead: 0.00004,
+};
+const MODEL_MULTIPLIER = { haiku: 0.3, sonnet: 1.0, opus: 2.0, other: 1.0 };
+const G_CO2_PER_KWH = 473;           // Ember 2024 global lifecycle
+const ML_WATER_PER_KWH = 1800;       // Mytton 2021 / de Vries 2023
+const KG_CO2_PER_TREE_YEAR = 21.77;  // US Forest Service
 const KG_CO2_PER_TREE_LIFETIME = 450;
+const SCC_USD_PER_TONNE_CO2 = 255;   // EPA 2023 Final Rule, 2025 value
+
+function classifyModel(name) {
+    if (!name) return 'other';
+    const n = name.toLowerCase();
+    if (n.includes('haiku')) return 'haiku';
+    if (n.includes('opus')) return 'opus';
+    if (n.includes('sonnet')) return 'sonnet';
+    return 'other';
+}
 
 const VERDICTS = [
     'The Amazon rainforest left a one-star review.',
@@ -91,6 +106,10 @@ class CcusageIndicator extends PanelMenu.Button {
         this._tokensItem = new PopupMenu.PopupMenuItem('🔥 Tokens vaporized: --');
         this._tokensItem.sensitive = false;
         this.menu.addMenuItem(this._tokensItem);
+
+        this._sccItem = new PopupMenu.PopupMenuItem('💀 Social cost of carbon: --');
+        this._sccItem.sensitive = false;
+        this.menu.addMenuItem(this._sccItem);
 
         this._modelsItem = new PopupMenu.PopupMenuItem('🤖 Models used: --');
         this._modelsItem.sensitive = false;
@@ -161,20 +180,44 @@ class CcusageIndicator extends PanelMenu.Button {
     _parseAndUpdate(jsonStr) {
         try {
             const data = JSON.parse(jsonStr);
-            const totals = data?.totals ?? null;
-            const input = totals?.inputTokens || 0;
-            const output = totals?.outputTokens || 0;
-            const cacheCreate = totals?.cacheCreationTokens || 0;
-            const cacheRead = totals?.cacheReadTokens || 0;
+            const day = data?.daily?.[0];
+            let input = 0, output = 0, cacheCreate = 0, cacheRead = 0;
+            let wh = 0;
 
-            const effectiveTokens = input + output + cacheCreate + cacheRead * CACHE_READ_DISCOUNT;
+            const breakdowns = day?.modelBreakdowns || [];
+            if (breakdowns.length > 0) {
+                for (const mb of breakdowns) {
+                    const mKey = classifyModel(mb.modelName);
+                    const mult = MODEL_MULTIPLIER[mKey] ?? 1.0;
+                    const i = mb.inputTokens || 0;
+                    const o = mb.outputTokens || 0;
+                    const cc = mb.cacheCreationTokens || 0;
+                    const cr = mb.cacheReadTokens || 0;
+                    input += i; output += o; cacheCreate += cc; cacheRead += cr;
+                    wh += (i * BASELINE_WH_PER_TOKEN.input
+                         + o * BASELINE_WH_PER_TOKEN.output
+                         + cc * BASELINE_WH_PER_TOKEN.cacheCreate
+                         + cr * BASELINE_WH_PER_TOKEN.cacheRead) * mult;
+                }
+            } else {
+                const t = data?.totals ?? {};
+                input = t.inputTokens || 0;
+                output = t.outputTokens || 0;
+                cacheCreate = t.cacheCreationTokens || 0;
+                cacheRead = t.cacheReadTokens || 0;
+                wh = input * BASELINE_WH_PER_TOKEN.input
+                   + output * BASELINE_WH_PER_TOKEN.output
+                   + cacheCreate * BASELINE_WH_PER_TOKEN.cacheCreate
+                   + cacheRead * BASELINE_WH_PER_TOKEN.cacheRead;
+            }
+
             const totalTokens = input + output + cacheCreate + cacheRead;
-            const wh = effectiveTokens * WH_PER_TOKEN;
             const kwh = wh / 1000;
             const gCO2 = kwh * G_CO2_PER_KWH;
             const mlWater = kwh * ML_WATER_PER_KWH;
             const treeYears = (gCO2 / 1000) / KG_CO2_PER_TREE_YEAR;
             const treesCut = (gCO2 / 1000) / KG_CO2_PER_TREE_LIFETIME;
+            const sccUsd = (gCO2 / 1e6) * SCC_USD_PER_TONNE_CO2;
 
             this._label.set_text(this._fmtTrees(treeYears));
 
@@ -184,16 +227,24 @@ class CcusageIndicator extends PanelMenu.Button {
             this._co2Item.label.set_text(`☁ CO₂ belched: ${this._fmtCO2(gCO2)}`);
             this._waterItem.label.set_text(`💧 Water evaporated: ${this._fmtWater(mlWater)}`);
             this._tokensItem.label.set_text(`🔥 Tokens vaporized: ${this._fmtTokens(totalTokens)}`);
+            this._sccItem.label.set_text(`💀 Social cost of carbon: ${this._fmtUSD(sccUsd)}`);
 
-            const models = data?.daily?.[0]?.modelsUsed || [];
+            const models = day?.modelsUsed || [];
             const modelNames = models.map(m => m.replace('claude-', '').replace(/-\d{8}$/, '')).join(', ');
             this._modelsItem.label.set_text(`🤖 Models used: ${modelNames || '--'}`);
 
-            const seed = Math.floor(wh * 1000) + totalTokens;
+            const seed = Math.floor(wh * 10) + totalTokens;
             this._verdictItem.label.set_text(`💬 ${VERDICTS[seed % VERDICTS.length]}`);
         } catch {
             this._label.set_text('parse err');
         }
+    }
+
+    _fmtUSD(n) {
+        if (n >= 1) return '$' + n.toFixed(2);
+        if (n >= 0.01) return '$' + n.toFixed(4);
+        if (n <= 0) return '$0';
+        return '$' + n.toExponential(2);
     }
 
     _fmtTokens(n) {

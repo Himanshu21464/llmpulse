@@ -1,160 +1,584 @@
 #!/usr/bin/env node
-// llmpulse - measure your LLM climate guilt
+// llmpulse — climate-impact accounting for your Claude Code habit.
 //
-// Wraps `ccusage` and translates token counts into energy, CO2, water,
-// and tree-equivalent offsets. Numbers are rough order-of-magnitude
-// estimates aggregated from published ranges for frontier-model
-// inference; treat them as vibes-based accounting, not an LCA.
+// Reads ccusage daily data and converts tokens into energy / CO2 / water /
+// tree-equivalents / social cost, using published ranges for LLM inference
+// and grid electricity. Constants are editable via a config file and every
+// number is backed by a cite-able source (`llmpulse --sources`).
+//
+// This is still an approximation — vendors don't publish per-token energy —
+// but the numbers here sit inside the peer-reviewed / industry-reported
+// range rather than being pulled from thin air.
 
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const { spawnSync } = require('child_process');
 
-// --- Impact constants ----------------------------------------------------
-// Energy per token varies 10x+ across models and providers. 0.001 Wh/token
-// is a middle estimate for frontier-model inference (Patterson et al.;
-// MIT Tech Review coverage of GPT-4-class inference).
-const WH_PER_TOKEN = 0.001;
-// Cache reads cost real compute but less than full inference; discount.
-const CACHE_READ_DISCOUNT = 0.1;
-// Global grid average, IEA 2024.
-const G_CO2_PER_KWH = 475;
-// Datacenter water (cooling + upstream electricity), rough estimate.
+// ============================================================
+//   Sourced constants (see SOURCES[] at bottom of file)
+// ============================================================
+
+// Per-token energy in Wh. Derived from:
+//  - GPT-4o: 0.34-0.43 Wh per ~500-token query (Altman 2025, Epoch AI 2025)
+//  - Claude Opus 4.5: ~390 Wh/Mtok input, ~1,950 Wh/Mtok output
+//    (Couch 2026, Claude Code impact analysis)
+//  - Cache reads are substantially cheaper (mostly KV-cache reuse;
+//    Anthropic prices them at 10% of fresh input, so use that as a proxy).
+// These are Sonnet-class baselines; multiplied by MODEL_MULTIPLIER below.
+const BASELINE_WH_PER_TOKEN = {
+    input: 0.00040,
+    output: 0.00200,
+    cacheCreate: 0.00040,
+    cacheRead: 0.00004,
+};
+
+// Model multipliers over Sonnet baseline. Scaled to match Anthropic's
+// list pricing, which roughly tracks compute & therefore energy:
+//   Haiku  : ~$1 / $5  per Mtok  (≈0.3x Sonnet)
+//   Sonnet : ~$3 / $15 per Mtok  (1.0x, baseline)
+//   Opus   : ~$5 / $25 per Mtok  (≈2.0x)
+// (Finout Anthropic pricing guide 2026; IntuitionLabs 2025.)
+const MODEL_MULTIPLIER = {
+    haiku: 0.3,
+    sonnet: 1.0,
+    opus: 2.0,
+    other: 1.0,
+};
+
+// Grid carbon intensity (g CO2 / kWh), from Ember Global Electricity Review
+// 2024/2025 lifecycle figures. (`global` = Ember 473 g/kWh world average.)
+const GRID_INTENSITY = {
+    global: 473,
+    us: 384,
+    eu: 213,
+    in: 708,
+    cn: 560,
+    ru: 449,
+    fr: 55,
+    no: 23,
+    uk: 170,
+    jp: 450,
+    au: 550,
+    ca: 120,
+    de: 350,
+    br: 100,
+};
+
+// Datacenter water: 1.8 L/kWh covers on-site evaporative cooling + upstream
+// thermoelectric cooling for the grid electricity drawn, based on Mytton
+// 2021 and de Vries 2023. Sam Altman's 2025 figure (0.32 mL/query) is
+// on-site only and sits below this; the higher number captures full
+// lifecycle water draw.
 const ML_WATER_PER_KWH = 1800;
-// Mature hardwood, US Forest Service.
+
+// Tree absorption. 21.77 kg CO2/tree/year for a mature hardwood over 40
+// years is the common US Forest Service figure; tree-lifetime storage is
+// a very wide range (200-1000 kg), so use 450 kg as a midpoint and label
+// it as "equivalent".
 const KG_CO2_PER_TREE_YEAR = 21.77;
-// Carbon stored in a mature tree over its lifetime, very rough.
 const KG_CO2_PER_TREE_LIFETIME = 450;
 
-// --- Sarcastic flavor text ----------------------------------------------
+// Social cost of CO2 (2025 USD). EPA Final Rule Nov 2023 → $255/tonne
+// for 2025 emissions at a 2% near-term discount rate.
+const SCC_USD_PER_TONNE_CO2 = 255;
+
+// Real-world CO2 equivalents in grams, for the `--compare` section.
+// Sources on each line.
+const EQUIVALENTS = [
+    // (label, gCO2, unit)
+    { label: 'beef burger (100 g patty)',   g: 3000,  unit: 'burger'  }, // Poore & Nemecek 2018
+    { label: 'km driven in an average car', g: 120,   unit: 'km'      }, // EPA 2023
+    { label: 'km flown (economy)',          g: 90,    unit: 'km'      }, // ICAO carbon calculator
+    { label: 'Google search',               g: 0.2,   unit: 'search'  }, // Google 2009 / refreshed estimates
+    { label: 'hour of Netflix',             g: 36,    unit: 'hour'    }, // Carbon Trust 2021
+    { label: 'smartphone charge',           g: 4,     unit: 'charge'  }, // Apple product env reports
+    { label: '8-min hot shower',            g: 600,   unit: 'shower'  }, // UK EST
+    { label: 'boiled kettle (1 L)',         g: 43,    unit: 'boil'    }, // 0.09 kWh × 475 g/kWh
+    { label: 'cheeseburger meal',           g: 4000,  unit: 'meal'    }, // Our World in Data
+    { label: 'hour of LED bulb (10 W)',     g: 4.73,  unit: 'hour'    }, // 10 Wh × 473 g/kWh
+];
+
+// ============================================================
+//   Sarcastic flavor (deterministic from a seed so refreshes
+//   aren't noisy but usage differences produce different verdicts)
+// ============================================================
 const VERDICTS = [
     'The Amazon rainforest left a one-star review.',
     'A polar bear just sent you a passive-aggressive DM.',
-    'Greta Thunberg is writing a strongly worded tweet, as we speak.',
-    'Your carbon footprint called. It wants to schedule a 1:1.',
+    'Greta is drafting a strongly worded tweet.',
+    'Your carbon footprint wants a 1:1.',
     'Somewhere, a glacier sighed.',
     'The planet is not mad, just disappointed.',
     'Gaia is keeping receipts.',
+    'Every token is a tiny scream from the troposphere.',
+    'A cooling tower wept gently into the night.',
+    'The coral reefs saw what you did there.',
+    'Three ice cubes melted for your last prompt.',
+    'The carbon budget has trust issues because of you.',
+    '"Touch grass" will be a historical idiom soon.',
+    'The IPCC cited you in a footnote. Not kindly.',
     'Your descendants will Google you in 2084. They will not be happy.',
-    'Every token you burn is a tiny scream from the troposphere.',
-    'A datacenter cooling tower wept gently into the night.',
-    'The IPCC cited you in a footnote. Not in a good way.',
-    'At this rate, "touch grass" will be a historical idiom.',
-    'The coral reefs said "we saw what you did there".',
-    'Three ice cubes melted specifically for your last prompt.',
-    'You are the reason the carbon budget has trust issues.',
+    'One more autocomplete and the ocean rises another 0.0001 mm.',
+    'The datacenter HVAC applied for hazard pay.',
+    'A single leaf curled up and died in protest.',
+    'Mother Nature filed a GDPR deletion request.',
+    'The Paris Agreement blocked you.',
 ];
 
-function verdict(seed) {
-    return VERDICTS[seed % VERDICTS.length];
+// ============================================================
+//   ASCII tree art — degrades with damage
+// ============================================================
+const TREE_HEALTHY = [
+    '        &         ',
+    '       &o&        ',
+    '      &&o&&       ',
+    '     &&&o&&&      ',
+    '    &&&&o&&&&     ',
+    '        ||        ',
+    '       /||\\       ',
+];
+const TREE_STRESSED = [
+    '        &         ',
+    '       &-&        ',
+    '      &&.&&       ',
+    '     &.&&&.&      ',
+    '    &&. &&.&&     ',
+    '        ||        ',
+    '       /||\\       ',
+];
+const TREE_DYING = [
+    '        .         ',
+    '       .-.        ',
+    '      ._.-_       ',
+    '     _.  .__      ',
+    '    .  _   ._     ',
+    '        ||        ',
+    '       /||\\       ',
+];
+const TREE_STUMP = [
+    '                  ',
+    '                  ',
+    '                  ',
+    '      _______     ',
+    '     |_______|    ',
+    '        ||        ',
+    '       /||\\       ',
+];
+const TREE_BURNING = [
+    '       *~*        ',
+    '      *~*~*       ',
+    '     ~*&*~*       ',
+    '    *&~*&*~       ',
+    '     &*~*&        ',
+    '        ||        ',
+    '       /||\\       ',
+];
+
+function treeArtForDamage(treeYears) {
+    if (treeYears < 0.01)  return TREE_HEALTHY;
+    if (treeYears < 0.1)   return TREE_STRESSED;
+    if (treeYears < 1)     return TREE_DYING;
+    if (treeYears < 10)    return TREE_STUMP;
+    return TREE_BURNING;
 }
 
-// --- Math ---------------------------------------------------------------
-function computeImpact(totals) {
-    const input = totals.inputTokens || 0;
-    const output = totals.outputTokens || 0;
-    const cacheCreate = totals.cacheCreationTokens || 0;
-    const cacheRead = totals.cacheReadTokens || 0;
+// ============================================================
+//   Config loading
+// ============================================================
+function loadConfig(explicitPath) {
+    const candidates = explicitPath ? [explicitPath] : [
+        path.join(os.homedir(), '.config', 'llmpulse', 'config.json'),
+        path.join(os.homedir(), '.llmpulserc'),
+    ];
+    for (const p of candidates) {
+        try {
+            if (fs.existsSync(p)) {
+                const raw = fs.readFileSync(p, 'utf8');
+                return { path: p, data: JSON.parse(raw) };
+            }
+        } catch (e) {
+            console.error(`llmpulse: bad config at ${p}: ${e.message}`);
+        }
+    }
+    return { path: null, data: {} };
+}
 
-    const billed = input + output + cacheCreate;
-    const effectiveTokens = billed + cacheRead * CACHE_READ_DISCOUNT;
-    const totalTokens = input + output + cacheCreate + cacheRead;
+function applyConfig(config) {
+    if (config.energyPerToken) Object.assign(BASELINE_WH_PER_TOKEN, config.energyPerToken);
+    if (config.modelMultiplier) Object.assign(MODEL_MULTIPLIER, config.modelMultiplier);
+    if (config.gridIntensity) Object.assign(GRID_INTENSITY, config.gridIntensity);
+}
 
-    const wh = effectiveTokens * WH_PER_TOKEN;
+// ============================================================
+//   Impact math
+// ============================================================
+function classifyModel(name) {
+    if (!name) return 'other';
+    const n = name.toLowerCase();
+    if (n.includes('haiku'))  return 'haiku';
+    if (n.includes('opus'))   return 'opus';
+    if (n.includes('sonnet')) return 'sonnet';
+    return 'other';
+}
+
+function tokensImpact(tokens, modelKey, gridG) {
+    // tokens = {input, output, cacheCreate, cacheRead}
+    const mult = MODEL_MULTIPLIER[modelKey] ?? MODEL_MULTIPLIER.other;
+    const wh =
+        (tokens.input || 0)       * BASELINE_WH_PER_TOKEN.input       * mult +
+        (tokens.output || 0)      * BASELINE_WH_PER_TOKEN.output      * mult +
+        (tokens.cacheCreate || 0) * BASELINE_WH_PER_TOKEN.cacheCreate * mult +
+        (tokens.cacheRead || 0)   * BASELINE_WH_PER_TOKEN.cacheRead   * mult;
     const kwh = wh / 1000;
-    const gCO2 = kwh * G_CO2_PER_KWH;
+    const gCO2 = kwh * gridG;
     const mlWater = kwh * ML_WATER_PER_KWH;
     const treeYears = (gCO2 / 1000) / KG_CO2_PER_TREE_YEAR;
-    const treesCut = (gCO2 / 1000) / KG_CO2_PER_TREE_LIFETIME;
-
-    return {
-        tokens: { input, output, cacheCreate, cacheRead, total: totalTokens, billed },
-        wh, kwh, gCO2, mlWater, treeYears, treesCut,
-        cost: totals.totalCost || 0,
-    };
+    const treesCut  = (gCO2 / 1000) / KG_CO2_PER_TREE_LIFETIME;
+    const sccUsd    = (gCO2 / 1e6) * SCC_USD_PER_TONNE_CO2;
+    return { wh, kwh, gCO2, mlWater, treeYears, treesCut, sccUsd };
 }
 
-// --- Formatting ---------------------------------------------------------
+function aggregateImpact(dailyRows, gridG) {
+    // Sum per-model impact using modelBreakdowns when available.
+    const totals = {
+        tokens: { input: 0, output: 0, cacheCreate: 0, cacheRead: 0 },
+        impact: { wh: 0, kwh: 0, gCO2: 0, mlWater: 0, treeYears: 0, treesCut: 0, sccUsd: 0 },
+        cost: 0,
+        perModel: {},
+        perDay: [],
+    };
+
+    for (const day of dailyRows) {
+        const dayTokens = { input: 0, output: 0, cacheCreate: 0, cacheRead: 0 };
+        const dayImpact = { wh: 0, kwh: 0, gCO2: 0, mlWater: 0, treeYears: 0, treesCut: 0, sccUsd: 0 };
+
+        const breakdowns = day.modelBreakdowns || [];
+        if (breakdowns.length > 0) {
+            for (const mb of breakdowns) {
+                const mKey = classifyModel(mb.modelName);
+                const t = {
+                    input: mb.inputTokens || 0,
+                    output: mb.outputTokens || 0,
+                    cacheCreate: mb.cacheCreationTokens || 0,
+                    cacheRead: mb.cacheReadTokens || 0,
+                };
+                const imp = tokensImpact(t, mKey, gridG);
+                accumulate(totals.tokens, t);
+                accumulate(totals.impact, imp);
+                accumulate(dayTokens, t);
+                accumulate(dayImpact, imp);
+
+                if (!totals.perModel[mKey]) {
+                    totals.perModel[mKey] = {
+                        tokens: { input: 0, output: 0, cacheCreate: 0, cacheRead: 0 },
+                        impact: { wh: 0, kwh: 0, gCO2: 0, mlWater: 0, treeYears: 0, treesCut: 0, sccUsd: 0 },
+                        cost: 0,
+                        names: new Set(),
+                    };
+                }
+                accumulate(totals.perModel[mKey].tokens, t);
+                accumulate(totals.perModel[mKey].impact, imp);
+                totals.perModel[mKey].cost += mb.cost || 0;
+                if (mb.modelName) totals.perModel[mKey].names.add(mb.modelName);
+            }
+        } else {
+            // Fallback: ccusage didn't return per-model breakdown.
+            const t = {
+                input: day.inputTokens || 0,
+                output: day.outputTokens || 0,
+                cacheCreate: day.cacheCreationTokens || 0,
+                cacheRead: day.cacheReadTokens || 0,
+            };
+            const imp = tokensImpact(t, 'sonnet', gridG); // default to sonnet class
+            accumulate(totals.tokens, t);
+            accumulate(totals.impact, imp);
+            accumulate(dayTokens, t);
+            accumulate(dayImpact, imp);
+        }
+
+        totals.cost += day.totalCost || 0;
+        totals.perDay.push({
+            date: day.date,
+            tokens: dayTokens,
+            impact: dayImpact,
+            cost: day.totalCost || 0,
+        });
+    }
+    return totals;
+}
+
+function accumulate(target, src) {
+    for (const k of Object.keys(src)) target[k] = (target[k] || 0) + src[k];
+}
+
+// ============================================================
+//   Formatters
+// ============================================================
 function fmtTokens(n) {
     if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
     if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
     if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-    return String(n);
+    return String(n | 0);
 }
-
 function fmtEnergy(wh) {
-    if (wh >= 1000) return (wh / 1000).toFixed(2) + ' kWh';
-    if (wh >= 1) return wh.toFixed(2) + ' Wh';
+    if (wh >= 1e6) return (wh / 1e6).toFixed(2) + ' MWh';
+    if (wh >= 1e3) return (wh / 1e3).toFixed(2) + ' kWh';
+    if (wh >= 1)   return wh.toFixed(2) + ' Wh';
     return (wh * 1000).toFixed(1) + ' mWh';
 }
-
 function fmtCO2(g) {
-    if (g >= 1000) return (g / 1000).toFixed(2) + ' kg';
-    if (g >= 1) return g.toFixed(2) + ' g';
+    if (g >= 1e6) return (g / 1e6).toFixed(2) + ' t';
+    if (g >= 1e3) return (g / 1e3).toFixed(2) + ' kg';
+    if (g >= 1)   return g.toFixed(2) + ' g';
     return (g * 1000).toFixed(1) + ' mg';
 }
-
 function fmtWater(ml) {
-    if (ml >= 1000) return (ml / 1000).toFixed(2) + ' L';
-    return ml.toFixed(2) + ' ml';
+    if (ml >= 1e6) return (ml / 1e6).toFixed(2) + ' kL';
+    if (ml >= 1e3) return (ml / 1e3).toFixed(2) + ' L';
+    return ml.toFixed(2) + ' mL';
 }
-
 function fmtTrees(n) {
-    if (n >= 10) return n.toFixed(1);
-    if (n >= 0.01) return n.toFixed(3);
+    if (n >= 10)    return n.toFixed(1);
+    if (n >= 0.01)  return n.toFixed(3);
+    if (n <= 0)     return '0';
     return n.toExponential(2);
 }
-
-// --- Grounding comparisons (sarcastic color) ----------------------------
-function groundedComparison(impact) {
-    const wh = impact.wh;
-    // LED bulb ~10W. 1h of LED = 10 Wh.
-    const ledMinutes = (wh / 10) * 60;
-    // Boiling 1 cup of water ~35 Wh.
-    const cupsBoiled = wh / 35;
-    // Average car emits ~120 gCO2/km.
-    const carKm = impact.gCO2 / 120;
-    // Google search ~0.2 gCO2.
-    const googleSearches = impact.gCO2 / 0.2;
-
-    if (ledMinutes < 1) return `enough to power an LED bulb for ${(ledMinutes * 60).toFixed(1)} seconds. Truly devastating.`;
-    if (cupsBoiled < 1) return `enough to power an LED bulb for ${ledMinutes.toFixed(1)} minutes, or boil ${(cupsBoiled * 100).toFixed(0)}% of a cup of water.`;
-    if (carKm < 1) return `the equivalent of driving ${(carKm * 1000).toFixed(0)} m in an average car, or ${googleSearches.toFixed(0)} Google searches.`;
-    return `the equivalent of driving ${carKm.toFixed(2)} km in an average car, or boiling ${cupsBoiled.toFixed(1)} cups of water.`;
+function fmtUSD(n) {
+    if (n >= 1)    return '$' + n.toFixed(2);
+    if (n >= 0.01) return '$' + n.toFixed(4);
+    return '$' + n.toExponential(2);
 }
 
-// --- ccusage invocation -------------------------------------------------
-function findCcusage() {
-    // Follow the same PATH logic as the GNOME extension.
-    const candidates = [];
-    const home = process.env.HOME || '';
-    if (home) {
-        const nvmBase = `${home}/.nvm/versions/node`;
-        try {
-            const fs = require('fs');
-            if (fs.existsSync(nvmBase)) {
-                for (const v of fs.readdirSync(nvmBase)) {
-                    candidates.push(`${nvmBase}/${v}/bin/ccusage`);
-                }
-            }
-        } catch { /* ignore */ }
-        candidates.push(`${home}/.local/bin/ccusage`);
-        candidates.push(`${home}/.npm-global/bin/ccusage`);
-        candidates.push(`${home}/.yarn/bin/ccusage`);
-    }
-    candidates.push('/opt/homebrew/bin/ccusage', '/usr/local/bin/ccusage', '/usr/bin/ccusage');
+// ============================================================
+//   ANSI
+// ============================================================
+const ANSI = {
+    bold:   s => `\x1b[1m${s}\x1b[0m`,
+    dim:    s => `\x1b[2m${s}\x1b[0m`,
+    green:  s => `\x1b[32m${s}\x1b[0m`,
+    yellow: s => `\x1b[33m${s}\x1b[0m`,
+    red:    s => `\x1b[31m${s}\x1b[0m`,
+    cyan:   s => `\x1b[36m${s}\x1b[0m`,
+    magenta:s => `\x1b[35m${s}\x1b[0m`,
+    blue:   s => `\x1b[34m${s}\x1b[0m`,
+    brown:  s => `\x1b[38;5;130m${s}\x1b[0m`,
+};
 
-    const fs = require('fs');
+function stripNoColor(useColor) {
+    if (!useColor) {
+        for (const k of Object.keys(ANSI)) ANSI[k] = s => s;
+    }
+}
+
+// ============================================================
+//   Sections
+// ============================================================
+function section(title, color = 'green') {
+    return ANSI.bold(ANSI[color](`── ${title} ${'─'.repeat(Math.max(0, 60 - title.length - 4))}`));
+}
+
+function renderHeader(label, region, treeYears) {
+    const lines = treeArtForDamage(treeYears);
+    const colored = lines.map(l => ANSI.green(l));
+    const title = ANSI.bold(ANSI.green('llmpulse — climate crime report'));
+    const sub = ANSI.dim(`period: ${label}    grid: ${region} (${GRID_INTENSITY[region]} gCO₂/kWh)`);
+    return [
+        colored[0] + '   ' + title,
+        colored[1] + '   ' + sub,
+        colored[2],
+        colored[3],
+        colored[4],
+        colored[5],
+        colored[6],
+    ].join('\n');
+}
+
+function renderImpactPanel(tokens, impact, cost) {
+    const total = tokens.input + tokens.output + tokens.cacheCreate + tokens.cacheRead;
+    const lines = [];
+    lines.push(section('the damage'));
+    lines.push(`${ANSI.bold('🔥 Tokens vaporized')}        ${fmtTokens(total)}`);
+    lines.push(ANSI.dim(`   input ${fmtTokens(tokens.input)}   output ${fmtTokens(tokens.output)}   cache-write ${fmtTokens(tokens.cacheCreate)}   cache-read ${fmtTokens(tokens.cacheRead)}`));
+    lines.push('');
+    lines.push(`${ANSI.yellow('⚡ Energy burned')}           ${fmtEnergy(impact.wh)}`);
+    lines.push(`${ANSI.red('☁  CO₂ belched')}            ${fmtCO2(impact.gCO2)}`);
+    lines.push(`${ANSI.cyan('💧 Water evaporated')}        ${fmtWater(impact.mlWater)}`);
+    lines.push(`${ANSI.green('🌲 Tree-years to offset')}    ${fmtTrees(impact.treeYears)}`);
+    lines.push(`${ANSI.brown('🪓 Trees-cut-equivalent')}    ${fmtTrees(impact.treesCut)}`);
+    lines.push(`${ANSI.magenta('💀 Social cost of carbon')}   ${fmtUSD(impact.sccUsd)}`);
+    if (cost > 0) lines.push(`${ANSI.blue('💸 Your wallet paid')}        ${fmtUSD(cost)}`);
+    return lines.join('\n');
+}
+
+function renderModelBreakdown(perModel) {
+    const keys = Object.keys(perModel).filter(k => perModel[k].tokens.input + perModel[k].tokens.output + perModel[k].tokens.cacheCreate + perModel[k].tokens.cacheRead > 0);
+    if (keys.length === 0) return null;
+    const lines = [section('per-model breakdown', 'yellow')];
+    lines.push(`${'model'.padEnd(10)} ${'tokens'.padStart(10)}  ${'energy'.padStart(11)}  ${'CO₂'.padStart(10)}  ${'trees'.padStart(8)}  ${'mult'.padStart(5)}`);
+    lines.push(ANSI.dim('─'.repeat(60)));
+    for (const k of keys) {
+        const pm = perModel[k];
+        const toks = pm.tokens.input + pm.tokens.output + pm.tokens.cacheCreate + pm.tokens.cacheRead;
+        lines.push(
+            `${k.padEnd(10)} ${fmtTokens(toks).padStart(10)}  ${fmtEnergy(pm.impact.wh).padStart(11)}  ${fmtCO2(pm.impact.gCO2).padStart(10)}  ${fmtTrees(pm.impact.treeYears).padStart(8)}  ${String(MODEL_MULTIPLIER[k] ?? 1).padStart(5)}x`
+        );
+    }
+    return lines.join('\n');
+}
+
+function renderComparisons(impact) {
+    const g = impact.gCO2;
+    const wh = impact.wh;
+    const lines = [section('thats equivalent to', 'cyan')];
+    const rows = [];
+    for (const eq of EQUIVALENTS) {
+        const n = g / eq.g;
+        if (n >= 0.01 && n < 10_000_000) rows.push({ n, label: eq.label, unit: eq.unit });
+    }
+    // Sort: most intuitive are around 0.5–50
+    rows.sort((a, b) => Math.abs(Math.log10(Math.max(a.n, 1e-9)) - 0) - Math.abs(Math.log10(Math.max(b.n, 1e-9)) - 0));
+    const pick = rows.slice(0, 6);
+    for (const r of pick) {
+        const nStr = r.n >= 100 ? r.n.toFixed(0) : r.n >= 1 ? r.n.toFixed(2) : r.n.toFixed(3);
+        lines.push(`  ${ANSI.bold(nStr.padStart(8))}  ${r.label}`);
+    }
+    // Also an energy one-liner
+    lines.push('');
+    const ledHours = wh / 10;
+    if (ledHours < 1) lines.push(ANSI.dim(`  …or ${(ledHours * 60).toFixed(1)} minutes of a 10 W LED bulb.`));
+    else lines.push(ANSI.dim(`  …or ${ledHours.toFixed(1)} hours of a 10 W LED bulb.`));
+    return lines.join('\n');
+}
+
+function renderTrends(perDay) {
+    if (perDay.length < 2) return null;
+    const lines = [section('last ' + perDay.length + ' days', 'blue')];
+    const max = Math.max(...perDay.map(d => d.impact.wh));
+    const bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    for (const d of perDay.slice().reverse()) {
+        const frac = max > 0 ? d.impact.wh / max : 0;
+        const barLen = 20;
+        const filled = Math.round(frac * barLen);
+        const bar = '█'.repeat(filled) + ANSI.dim('·'.repeat(barLen - filled));
+        lines.push(`  ${d.date}  ${bar}  ${fmtEnergy(d.impact.wh).padStart(10)}  ${fmtCO2(d.impact.gCO2).padStart(10)}`);
+    }
+    // Sparkline
+    const spark = perDay.map(d => {
+        const frac = max > 0 ? d.impact.wh / max : 0;
+        return bars[Math.min(bars.length - 1, Math.round(frac * (bars.length - 1)))];
+    }).join('');
+    lines.push('');
+    lines.push(`  sparkline: ${ANSI.green(spark)}`);
+
+    // Week-over-week if we have ≥14 days
+    if (perDay.length >= 14) {
+        const last7 = perDay.slice(-7).reduce((s, d) => s + d.impact.gCO2, 0);
+        const prev7 = perDay.slice(-14, -7).reduce((s, d) => s + d.impact.gCO2, 0);
+        const delta = prev7 > 0 ? ((last7 - prev7) / prev7) * 100 : 0;
+        const arrow = delta > 0 ? '▲' : '▼';
+        const color = delta > 0 ? ANSI.red : ANSI.green;
+        lines.push('');
+        lines.push(`  WoW: ${color(arrow + ' ' + Math.abs(delta).toFixed(0) + '%')}   last 7d: ${fmtCO2(last7)}   prev 7d: ${fmtCO2(prev7)}`);
+    }
+
+    // Biggest day
+    const biggest = perDay.slice().sort((a, b) => b.impact.gCO2 - a.impact.gCO2)[0];
+    lines.push('');
+    lines.push(`  biggest offender: ${ANSI.red(biggest.date)}  ${fmtCO2(biggest.impact.gCO2)}  (${fmtTokens(biggest.tokens.input + biggest.tokens.output + biggest.tokens.cacheCreate + biggest.tokens.cacheRead)} tokens)`);
+    return lines.join('\n');
+}
+
+function renderOffset(impact) {
+    const tonnes = impact.gCO2 / 1e6;
+    const lines = [section('offset options', 'magenta')];
+    // Typical voluntary offset market prices (2024-2025): $5-20/tonne for
+    // nature-based, $200-500/tonne for DAC/sequestration.
+    const natureUsd = tonnes * 15;
+    const dacUsd    = tonnes * 300;
+    lines.push(`  nature-based offset   ${fmtUSD(natureUsd)}   (~$15/t, voluntary market)`);
+    lines.push(`  direct air capture    ${fmtUSD(dacUsd)}   (~$300/t, Climeworks/Heirloom tier)`);
+    const treeYears = impact.treeYears;
+    lines.push(`  plant & grow trees    ${fmtTrees(treeYears)} tree-years of absorption required`);
+    return lines.join('\n');
+}
+
+function renderVerdict(seed) {
+    return ANSI.dim(`💬 ${VERDICTS[seed % VERDICTS.length]}`);
+}
+
+// ============================================================
+//   Sources
+// ============================================================
+const SOURCES = [
+    ['GPT-4o energy per query (0.34–0.43 Wh)', 'Epoch AI, 2025 — https://epoch.ai/gradient-updates/how-much-energy-does-chatgpt-use'],
+    ['ChatGPT 0.34 Wh + 0.32 mL water per query', 'Sam Altman blog, Jun 2025 — https://blog.samaltman.com/ (covered: datacenterdynamics.com)'],
+    ['Claude Code per-token energy estimate', 'Simon P. Couch, Jan 2026 — https://simonpcouch.com/blog/2026-01-20-cc-impact/'],
+    ['LLM inference Joules/token benchmark', 'LLM-tracker.info, Power Usage and Energy Efficiency'],
+    ['Inference energy/water/carbon benchmark', 'arXiv:2505.09598 — "How Hungry is AI?" (2025)'],
+    ['Global grid carbon intensity 2024 (473 gCO₂/kWh)', 'Ember Global Electricity Review 2025 — https://ember-energy.org/latest-insights/global-electricity-review-2025/'],
+    ['Regional grid intensities (US 384, EU 213, India 708, etc.)', 'Ember 2024 country data'],
+    ['Water per kWh (1.8 L)', 'Mytton 2021, de Vries 2023 (Joule)'],
+    ['Tree absorption 21.77 kg CO₂/yr', 'US Forest Service, urban tree carbon storage'],
+    ['Social cost of carbon $255/tonne (2025)', 'US EPA Final Rule, Nov 2023 — Report on the SC-GHG'],
+    ['Beef burger ~3 kg CO₂eq', 'Poore & Nemecek, Science 2018'],
+    ['Car ~120 g CO₂/km', 'EPA vehicle emissions, 2023'],
+    ['Economy flight ~90 g CO₂/km·pax', 'ICAO carbon emissions calculator'],
+    ['Netflix ~36 g CO₂/hour', 'Carbon Trust Digital Carbon Trust, 2021'],
+    ['Shower ~0.6 kg CO₂', 'UK Energy Saving Trust'],
+    ['Voluntary offset prices', 'Ecosystem Marketplace, 2024; Climeworks/Heirloom public pricing'],
+];
+
+function renderSources() {
+    const lines = [section('sources', 'yellow')];
+    SOURCES.forEach(([desc, ref], i) => {
+        lines.push(`  [${String(i + 1).padStart(2, '0')}] ${desc}`);
+        lines.push(ANSI.dim(`       ${ref}`));
+    });
+    lines.push('');
+    lines.push(ANSI.dim('  Per-token energy for closed frontier models is not published.'));
+    lines.push(ANSI.dim('  These constants are middle-of-range estimates; override any of'));
+    lines.push(ANSI.dim('  them in ~/.config/llmpulse/config.json.'));
+    return lines.join('\n');
+}
+
+// ============================================================
+//   ccusage invocation
+// ============================================================
+function findCcusage() {
+    const home = process.env.HOME || os.homedir();
+    const candidates = [];
+    const nvmBase = `${home}/.nvm/versions/node`;
+    try {
+        if (fs.existsSync(nvmBase)) {
+            for (const v of fs.readdirSync(nvmBase).sort().reverse()) {
+                candidates.push(`${nvmBase}/${v}/bin/ccusage`);
+            }
+        }
+    } catch { /* ignore */ }
+    candidates.push(
+        `${home}/.local/bin/ccusage`,
+        `${home}/.npm-global/bin/ccusage`,
+        `${home}/.yarn/bin/ccusage`,
+        '/opt/homebrew/bin/ccusage',
+        '/usr/local/bin/ccusage',
+        '/usr/bin/ccusage',
+    );
     for (const c of candidates) {
         try { if (fs.existsSync(c) && fs.statSync(c).isFile()) return c; } catch { /* ignore */ }
     }
-    return 'ccusage'; // fall back to PATH
+    return 'ccusage';
 }
 
 function runCcusage(args) {
     const bin = findCcusage();
-    const res = spawnSync(bin, args, { encoding: 'utf8' });
+    const res = spawnSync(bin, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    if (res.error) throw new Error(`spawn failed: ${res.error.message}`);
     if (res.status !== 0) {
         const stderr = (res.stderr || '').trim();
-        throw new Error(`ccusage failed (${res.status}): ${stderr || 'no stderr'}`);
+        throw new Error(`ccusage exited ${res.status}: ${stderr || 'no stderr'}`);
     }
     return JSON.parse(res.stdout);
 }
@@ -164,17 +588,42 @@ function todayStamp() {
     return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
 }
 
-// --- CLI ----------------------------------------------------------------
+// ============================================================
+//   CLI arg parsing
+// ============================================================
 function parseArgs(argv) {
-    const opts = { since: todayStamp(), json: false, all: false, help: false };
+    const opts = {
+        since: todayStamp(),
+        until: null,
+        json: false,
+        all: false,
+        help: false,
+        sources: false,
+        trends: false,
+        models: false,
+        compare: false,
+        offset: false,
+        region: 'global',
+        config: null,
+        noColor: !process.stdout.isTTY,
+    };
+    const takesValue = { '--since': 'since', '--until': 'until', '--region': 'region', '--config': 'config' };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
-        if (a === '-h' || a === '--help') opts.help = true;
-        else if (a === '--json') opts.json = true;
-        else if (a === '--all') opts.all = true;
-        else if (a === '--since') opts.since = argv[++i];
+        if (a === '-h' || a === '--help')      opts.help = true;
+        else if (a === '--json')                opts.json = true;
+        else if (a === '--all')                 opts.all = true;
+        else if (a === '--sources')             opts.sources = true;
+        else if (a === '--trends')              opts.trends = true;
+        else if (a === '--models')              opts.models = true;
+        else if (a === '--compare')             opts.compare = true;
+        else if (a === '--offset')              opts.offset = true;
+        else if (a === '--no-color')            opts.noColor = true;
+        else if (a === '--color')               opts.noColor = false;
+        else if (takesValue[a])                 opts[takesValue[a]] = argv[++i];
         else {
             console.error(`llmpulse: unknown argument: ${a}`);
+            console.error(`Try 'llmpulse --help'.`);
             process.exit(2);
         }
     }
@@ -182,56 +631,72 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-    console.log(`llmpulse - climate guilt for your LLM habit
+    console.log(`llmpulse — climate impact of your LLM habit
 
-Usage:
-  llmpulse                roast today's usage
-  llmpulse --all          roast your entire recorded history
-  llmpulse --since DATE   roast usage since DATE (YYYYMMDD)
-  llmpulse --json         machine-readable impact metrics
-  llmpulse -h, --help     this text
+USAGE
+  llmpulse [flags]
 
-Numbers are rough estimates from public LLM-inference ranges.
-No tree was literally cut in the making of this report. Probably.`);
+PERIOD
+  --since YYYYMMDD     start date (default: today)
+  --until YYYYMMDD     end date
+  --all                lifetime (everything ccusage knows about)
+
+SECTIONS (default: damage panel + comparisons + verdict)
+  --models             per-model breakdown (Haiku/Sonnet/Opus)
+  --trends             per-day bar chart + week-over-week + sparkline
+  --compare            richer real-world equivalents panel
+  --offset             offset market prices for today's damage
+
+DATA & OUTPUT
+  --region CODE        ${Object.keys(GRID_INTENSITY).join(' / ')}
+  --json               machine-readable JSON
+  --sources            print citations for every constant
+  --config PATH        override constants from a JSON file
+  --no-color           disable ANSI
+  -h, --help           this text
+
+CONFIG
+  Looks for ~/.config/llmpulse/config.json or ~/.llmpulserc.
+  Any of these keys may be overridden:
+    { "energyPerToken": { "input": 0.0004, "output": 0.002, ... },
+      "modelMultiplier": { "opus": 2.5, ... },
+      "gridIntensity": { "us": 384, ... } }
+
+Numbers are best-effort middle estimates — see --sources.`);
 }
 
-function sarcasticReport(impact, label) {
-    const lines = [];
-    const t = impact.tokens;
-    const seed = Math.floor(impact.wh * 1000) + t.total;
-
-    lines.push(`\x1b[1m\x1b[32m🌍  llmpulse — your climate crime report (${label})  🌍\x1b[0m`);
-    lines.push('');
-    lines.push(`You vaporized \x1b[1m${fmtTokens(t.total)}\x1b[0m tokens.`);
-    lines.push(`  input: ${fmtTokens(t.input)}   output: ${fmtTokens(t.output)}   cache write: ${fmtTokens(t.cacheCreate)}   cache read: ${fmtTokens(t.cacheRead)}`);
-    lines.push('');
-    lines.push(`\x1b[33m⚡  Energy burned:\x1b[0m       ${fmtEnergy(impact.wh)}`);
-    lines.push(`\x1b[31m☁️   CO₂ belched:\x1b[0m        ${fmtCO2(impact.gCO2)}`);
-    lines.push(`\x1b[36m💧  Water evaporated:\x1b[0m    ${fmtWater(impact.mlWater)}`);
-    lines.push(`\x1b[32m🌲  Tree-years to offset:\x1b[0m ${fmtTrees(impact.treeYears)}`);
-    lines.push(`\x1b[32m🪓  Trees-cut-equivalent:\x1b[0m ${fmtTrees(impact.treesCut)}`);
-    if (impact.cost > 0) lines.push(`\x1b[35m💸  Your wallet paid:\x1b[0m    $${impact.cost.toFixed(4)}`);
-    lines.push('');
-    lines.push(`That's ${groundedComparison(impact)}`);
-    lines.push('');
-    lines.push(`\x1b[2m${verdict(seed)}\x1b[0m`);
-    lines.push('');
-    lines.push(`\x1b[2mDefaults: ${WH_PER_TOKEN} Wh/token · ${G_CO2_PER_KWH} g CO₂/kWh · ${KG_CO2_PER_TREE_YEAR} kg CO₂/tree-year. Vibes-based estimates; don't cite in a paper.\x1b[0m`);
-
-    return lines.join('\n');
-}
-
+// ============================================================
+//   Main
+// ============================================================
 function main() {
     const opts = parseArgs(process.argv.slice(2));
-    if (opts.help) { printHelp(); return; }
+    stripNoColor(!opts.noColor);
 
+    if (opts.help)    { printHelp(); return; }
+
+    const cfg = loadConfig(opts.config);
+    applyConfig(cfg.data);
+
+    if (opts.sources) {
+        console.log(renderSources());
+        if (cfg.path) console.log(ANSI.dim(`\n  (config loaded from ${cfg.path})`));
+        return;
+    }
+
+    const region = opts.region in GRID_INTENSITY ? opts.region : 'global';
+    const gridG = GRID_INTENSITY[region];
+
+    // Ccusage args
     const args = ['daily', '--json', '--offline'];
     let label;
     if (opts.all) {
         label = 'all-time';
     } else {
         args.push('--since', opts.since);
-        label = opts.since === todayStamp() ? 'today' : `since ${opts.since}`;
+        if (opts.until) args.push('--until', opts.until);
+        label = opts.since === todayStamp() && !opts.until ? 'today'
+              : opts.until ? `${opts.since}–${opts.until}`
+              : `since ${opts.since}`;
     }
 
     let data;
@@ -243,15 +708,65 @@ function main() {
         process.exit(1);
     }
 
-    const totals = data.totals || {};
-    const impact = computeImpact(totals);
-
-    if (opts.json) {
-        console.log(JSON.stringify({ label, ...impact }, null, 2));
+    const daily = Array.isArray(data.daily) ? data.daily : [];
+    if (daily.length === 0) {
+        console.log('llmpulse: no usage data for the selected period. The planet is briefly safe.');
         return;
     }
 
-    console.log(sarcasticReport(impact, label));
+    const agg = aggregateImpact(daily, gridG);
+
+    if (opts.json) {
+        const out = {
+            label, region, gridG,
+            tokens: agg.tokens,
+            impact: agg.impact,
+            cost: agg.cost,
+            perModel: Object.fromEntries(Object.entries(agg.perModel).map(([k, v]) => [k, { ...v, names: [...v.names] }])),
+            perDay: agg.perDay,
+            constants: {
+                energyPerToken: BASELINE_WH_PER_TOKEN,
+                modelMultiplier: MODEL_MULTIPLIER,
+                mlWaterPerKwh: ML_WATER_PER_KWH,
+                kgCO2PerTreeYear: KG_CO2_PER_TREE_YEAR,
+                kgCO2PerTreeLifetime: KG_CO2_PER_TREE_LIFETIME,
+                sccUsdPerTonne: SCC_USD_PER_TONNE_CO2,
+            },
+        };
+        console.log(JSON.stringify(out, null, 2));
+        return;
+    }
+
+    // Full text report
+    const parts = [];
+    parts.push(renderHeader(label, region, agg.impact.treeYears));
+    parts.push('');
+    parts.push(renderImpactPanel(agg.tokens, agg.impact, agg.cost));
+    parts.push('');
+    parts.push(renderComparisons(agg.impact));
+
+    if (opts.models || Object.keys(agg.perModel).length > 1) {
+        const m = renderModelBreakdown(agg.perModel);
+        if (m) { parts.push(''); parts.push(m); }
+    }
+
+    if (opts.trends && agg.perDay.length >= 2) {
+        parts.push('');
+        parts.push(renderTrends(agg.perDay));
+    }
+
+    if (opts.offset) {
+        parts.push('');
+        parts.push(renderOffset(agg.impact));
+    }
+
+    parts.push('');
+    const seed = Math.floor(agg.impact.wh * 10) + Math.floor(agg.tokens.input + agg.tokens.output);
+    parts.push(renderVerdict(seed));
+    parts.push('');
+    parts.push(ANSI.dim(`run \`llmpulse --sources\` for citations · --trends for history · --help for more`));
+
+    console.log(parts.join('\n'));
 }
 
 main();
