@@ -2,7 +2,7 @@
 
 Measure the climate impact of your Claude Code habit — in your terminal and in your GNOME top bar.
 
-![GNOME 45-48](https://img.shields.io/badge/GNOME-45--48-blue)
+![GNOME 45-50](https://img.shields.io/badge/GNOME-45--50-blue)
 
 LLMpulse ships two tools:
 
