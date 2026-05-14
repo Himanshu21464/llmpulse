@@ -142,18 +142,14 @@ class CcusageIndicator extends PanelMenu.Button {
 
     _refresh() {
         try {
-            const today = new Date();
-            const dateStr = today.getFullYear().toString() +
-                (today.getMonth() + 1).toString().padStart(2, '0') +
-                today.getDate().toString().padStart(2, '0');
-
             // GNOME subprocesses don't inherit the user's interactive PATH,
             // so ccusage installed via nvm/npm/yarn/Homebrew isn't on PATH.
             // Extend PATH to cover common install locations before exec.
+            // No --since: we want all-time totals plus today's entry.
             const cmd =
                 'for d in "$HOME/.nvm/versions/node"/*/bin; do [ -d "$d" ] && PATH="$d:$PATH"; done; ' +
                 'PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.yarn/bin:$HOME/.config/yarn/global/node_modules/.bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:$PATH"; ' +
-                `exec ccusage daily --since ${dateStr} --json --offline 2>/dev/null`;
+                'exec ccusage daily --json --offline 2>/dev/null';
 
             const proc = Gio.Subprocess.new(
                 ['bash', '-c', cmd],
@@ -177,63 +173,110 @@ class CcusageIndicator extends PanelMenu.Button {
         }
     }
 
+    _computeFromBreakdowns(breakdowns) {
+        let input = 0, output = 0, cacheCreate = 0, cacheRead = 0, wh = 0;
+        for (const mb of breakdowns) {
+            const mKey = classifyModel(mb.modelName);
+            const mult = MODEL_MULTIPLIER[mKey] ?? 1.0;
+            const i = mb.inputTokens || 0;
+            const o = mb.outputTokens || 0;
+            const cc = mb.cacheCreationTokens || 0;
+            const cr = mb.cacheReadTokens || 0;
+            input += i; output += o; cacheCreate += cc; cacheRead += cr;
+            wh += (i * BASELINE_WH_PER_TOKEN.input
+                 + o * BASELINE_WH_PER_TOKEN.output
+                 + cc * BASELINE_WH_PER_TOKEN.cacheCreate
+                 + cr * BASELINE_WH_PER_TOKEN.cacheRead) * mult;
+        }
+        return {input, output, cacheCreate, cacheRead, wh};
+    }
+
+    _computeFromTotals(t) {
+        const input = t.inputTokens || 0;
+        const output = t.outputTokens || 0;
+        const cacheCreate = t.cacheCreationTokens || 0;
+        const cacheRead = t.cacheReadTokens || 0;
+        const wh = input * BASELINE_WH_PER_TOKEN.input
+                 + output * BASELINE_WH_PER_TOKEN.output
+                 + cacheCreate * BASELINE_WH_PER_TOKEN.cacheCreate
+                 + cacheRead * BASELINE_WH_PER_TOKEN.cacheRead;
+        return {input, output, cacheCreate, cacheRead, wh};
+    }
+
     _parseAndUpdate(jsonStr) {
         try {
             const data = JSON.parse(jsonStr);
-            const day = data?.daily?.[0];
-            let input = 0, output = 0, cacheCreate = 0, cacheRead = 0;
-            let wh = 0;
+            const daily = data?.daily ?? [];
 
-            const breakdowns = day?.modelBreakdowns || [];
-            if (breakdowns.length > 0) {
-                for (const mb of breakdowns) {
-                    const mKey = classifyModel(mb.modelName);
-                    const mult = MODEL_MULTIPLIER[mKey] ?? 1.0;
-                    const i = mb.inputTokens || 0;
-                    const o = mb.outputTokens || 0;
-                    const cc = mb.cacheCreationTokens || 0;
-                    const cr = mb.cacheReadTokens || 0;
-                    input += i; output += o; cacheCreate += cc; cacheRead += cr;
-                    wh += (i * BASELINE_WH_PER_TOKEN.input
-                         + o * BASELINE_WH_PER_TOKEN.output
-                         + cc * BASELINE_WH_PER_TOKEN.cacheCreate
-                         + cr * BASELINE_WH_PER_TOKEN.cacheRead) * mult;
+            const today = new Date();
+            const todayStr = today.getFullYear().toString() + '-' +
+                (today.getMonth() + 1).toString().padStart(2, '0') + '-' +
+                today.getDate().toString().padStart(2, '0');
+            const day = daily.find(d => d?.date === todayStr) ?? null;
+
+            // Per-day (today): prefer modelBreakdowns for accuracy, fall back to totals.
+            const todayStats = day
+                ? (day.modelBreakdowns?.length
+                    ? this._computeFromBreakdowns(day.modelBreakdowns)
+                    : this._computeFromTotals(day))
+                : {input: 0, output: 0, cacheCreate: 0, cacheRead: 0, wh: 0};
+
+            // All-time: sum across every day's modelBreakdowns when available
+            // (so model multipliers apply); else use top-level totals as a fallback.
+            let totalStats;
+            const haveAllBreakdowns = daily.length > 0 && daily.every(d => d?.modelBreakdowns?.length);
+            if (haveAllBreakdowns) {
+                totalStats = {input: 0, output: 0, cacheCreate: 0, cacheRead: 0, wh: 0};
+                for (const d of daily) {
+                    const s = this._computeFromBreakdowns(d.modelBreakdowns);
+                    totalStats.input += s.input;
+                    totalStats.output += s.output;
+                    totalStats.cacheCreate += s.cacheCreate;
+                    totalStats.cacheRead += s.cacheRead;
+                    totalStats.wh += s.wh;
                 }
             } else {
-                const t = data?.totals ?? {};
-                input = t.inputTokens || 0;
-                output = t.outputTokens || 0;
-                cacheCreate = t.cacheCreationTokens || 0;
-                cacheRead = t.cacheReadTokens || 0;
-                wh = input * BASELINE_WH_PER_TOKEN.input
-                   + output * BASELINE_WH_PER_TOKEN.output
-                   + cacheCreate * BASELINE_WH_PER_TOKEN.cacheCreate
-                   + cacheRead * BASELINE_WH_PER_TOKEN.cacheRead;
+                totalStats = this._computeFromTotals(data?.totals ?? {});
             }
 
-            const totalTokens = input + output + cacheCreate + cacheRead;
+            const todayTokens = todayStats.input + todayStats.output + todayStats.cacheCreate + todayStats.cacheRead;
+            const totalTokens = totalStats.input + totalStats.output + totalStats.cacheCreate + totalStats.cacheRead;
+
+            const todayGCO2 = (todayStats.wh / 1000) * G_CO2_PER_KWH;
+            const totalGCO2 = (totalStats.wh / 1000) * G_CO2_PER_KWH;
+            const todayTreeYears = (todayGCO2 / 1000) / KG_CO2_PER_TREE_YEAR;
+            const totalTreeYears = (totalGCO2 / 1000) / KG_CO2_PER_TREE_YEAR;
+
+            // Today metrics for the dropdown (matches prior behavior).
+            const wh = todayStats.wh;
             const kwh = wh / 1000;
-            const gCO2 = kwh * G_CO2_PER_KWH;
+            const gCO2 = todayGCO2;
             const mlWater = kwh * ML_WATER_PER_KWH;
-            const treeYears = (gCO2 / 1000) / KG_CO2_PER_TREE_YEAR;
             const treesCut = (gCO2 / 1000) / KG_CO2_PER_TREE_LIFETIME;
             const sccUsd = (gCO2 / 1e6) * SCC_USD_PER_TONNE_CO2;
 
-            this._label.set_text(this._fmtTrees(treeYears));
+            // Top bar: total trees │ today trees │ today tokens
+            this._label.set_text(
+                `Σ${this._fmtTrees(totalTreeYears)} │ d${this._fmtTrees(todayTreeYears)} │ ${this._fmtTokens(todayTokens)}`
+            );
 
-            this._treesItem.label.set_text(`🌲 Tree-years to offset: ${this._fmtTrees(treeYears)}`);
+            this._treesItem.label.set_text(
+                `🌲 Tree-years to offset: ${this._fmtTrees(todayTreeYears)} today · ${this._fmtTrees(totalTreeYears)} total`
+            );
             this._treesCutItem.label.set_text(`🪓 Trees-cut-equivalent: ${this._fmtTrees(treesCut)}`);
             this._energyItem.label.set_text(`⚡ Energy burned: ${this._fmtEnergy(wh)}`);
             this._co2Item.label.set_text(`☁ CO₂ belched: ${this._fmtCO2(gCO2)}`);
             this._waterItem.label.set_text(`💧 Water evaporated: ${this._fmtWater(mlWater)}`);
-            this._tokensItem.label.set_text(`🔥 Tokens vaporized: ${this._fmtTokens(totalTokens)}`);
+            this._tokensItem.label.set_text(
+                `🔥 Tokens vaporized: ${this._fmtTokens(todayTokens)} today · ${this._fmtTokens(totalTokens)} total`
+            );
             this._sccItem.label.set_text(`💀 Social cost of carbon: ${this._fmtUSD(sccUsd)}`);
 
             const models = day?.modelsUsed || [];
             const modelNames = models.map(m => m.replace('claude-', '').replace(/-\d{8}$/, '')).join(', ');
             this._modelsItem.label.set_text(`🤖 Models used: ${modelNames || '--'}`);
 
-            const seed = Math.floor(wh * 10) + totalTokens;
+            const seed = Math.floor(wh * 10) + todayTokens;
             this._verdictItem.label.set_text(`💬 ${VERDICTS[seed % VERDICTS.length]}`);
         } catch {
             this._label.set_text('parse err');
